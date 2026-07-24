@@ -30,6 +30,19 @@
 		matches: GlobalEndpointMatch[];
 	}
 
+	interface ImportUrlResult {
+		success: boolean;
+		documentsImported: number;
+		sourceType?: 'spec' | 'swagger-ui';
+		warnings?: string[];
+		error?: string;
+	}
+
+	interface BatchImportErrorItem {
+		url: string;
+		message: string;
+	}
+
 	const sessionState = fromStore(swaggerSession);
 	const methods: Array<'all' | HttpMethod> = [
 		'all',
@@ -51,9 +64,22 @@
 	let isLoading = $state(false);
 	let errorMessage = $state('');
 	let infoMessage = $state('');
+	let isBatchImporting = $state(false);
+	let batchFileName = $state('');
+	let batchTotal = $state(0);
+	let batchProcessed = $state(0);
+	let batchSucceeded = $state(0);
+	let batchDocumentsImported = $state(0);
+	let batchErrors = $state<BatchImportErrorItem[]>([]);
+	let isRefreshingAll = $state(false);
+	let refreshingById = $state<Record<string, boolean>>({});
 
 	function normalizeSearchText(value: string): string {
 		return value.trim().toLowerCase();
+	}
+
+	function getDocumentDisplayName(docId: string, fallback: string): string {
+		return documentNameById[docId] ?? fallback;
 	}
 
 	function endpointSearchBlob(
@@ -204,6 +230,172 @@
 		() => normalizeSearchText(globalSearchText).length > 0 || globalMethodFilter !== 'all'
 	);
 
+	const batchProgressLabel = $derived.by(() => {
+		if (batchTotal === 0) {
+			return '';
+		}
+
+		return `${batchProcessed}/${batchTotal} URL(s) processadas • ${batchSucceeded} sucesso(s) • ${batchErrors.length} erro(s)`;
+	});
+
+	const batchProgressPercent = $derived.by(() => {
+		if (batchTotal === 0) {
+			return 0;
+		}
+
+		return Math.min(100, Math.round((batchProcessed / batchTotal) * 100));
+	});
+
+	async function importUrlAndStore(url: string): Promise<ImportUrlResult> {
+		try {
+			const response = await fetch('/api/swagger', {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json'
+				},
+				body: JSON.stringify({ url })
+			});
+
+			const payload = (await response.json()) as ParseSwaggerApiResponse | { error?: string };
+
+			if (!response.ok || !('documents' in payload) || !Array.isArray(payload.documents)) {
+				const responseError =
+					typeof payload === 'object' && payload !== null && 'error' in payload
+						? payload.error
+						: undefined;
+
+				return {
+					success: false,
+					documentsImported: 0,
+					error: responseError ?? 'Falha ao processar a URL informada.'
+				};
+			}
+
+			for (const document of payload.documents) {
+				swaggerSession.upsert(document.sourceUrl, document);
+			}
+
+			return {
+				success: true,
+				documentsImported: payload.documents.length,
+				sourceType: payload.sourceType,
+				warnings: payload.warnings
+			};
+		} catch (error) {
+			return {
+				success: false,
+				documentsImported: 0,
+				error: error instanceof Error ? error.message : 'Erro inesperado ao carregar o swagger.'
+			};
+		}
+	}
+
+	function parseUrlsFromFileContent(content: string): string[] {
+		const lines = content
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+
+		return [...new Set(lines)];
+	}
+
+	function resetBatchStatus(): void {
+		batchTotal = 0;
+		batchProcessed = 0;
+		batchSucceeded = 0;
+		batchDocumentsImported = 0;
+		batchErrors = [];
+	}
+
+	async function runBatchImport(urls: string[], concurrency = 4): Promise<void> {
+		let cursor = 0;
+
+		const workers = Array.from({ length: Math.min(concurrency, urls.length) }, async () => {
+			while (true) {
+				const currentIndex = cursor;
+				cursor += 1;
+
+				if (currentIndex >= urls.length) {
+					break;
+				}
+
+				const currentUrl = urls[currentIndex];
+				const result = await importUrlAndStore(currentUrl);
+
+				if (result.success) {
+					batchSucceeded += 1;
+					batchDocumentsImported += result.documentsImported;
+
+					if (result.warnings && result.warnings.length > 0) {
+						batchErrors = [
+							...batchErrors,
+							...result.warnings.map((warning) => ({
+								url: currentUrl,
+								message: warning
+							}))
+						];
+					}
+				} else {
+					batchErrors = [
+						...batchErrors,
+						{
+							url: currentUrl,
+							message: result.error ?? 'Falha desconhecida ao importar URL.'
+						}
+					];
+				}
+
+				batchProcessed += 1;
+			}
+		});
+
+		await Promise.all(workers);
+	}
+
+	async function handleUrlsFileImport(event: Event): Promise<void> {
+		const input = event.currentTarget as HTMLInputElement | null;
+		const file = input?.files?.[0];
+
+		if (!file) {
+			return;
+		}
+
+		errorMessage = '';
+		infoMessage = '';
+		isBatchImporting = true;
+		batchFileName = file.name;
+		resetBatchStatus();
+
+		try {
+			const content = await file.text();
+			const urls = parseUrlsFromFileContent(content);
+
+			if (urls.length === 0) {
+				errorMessage = 'O arquivo não possui URLs válidas. Use uma URL por linha.';
+				return;
+			}
+
+			batchTotal = urls.length;
+			await runBatchImport(urls);
+
+			if (batchSucceeded > 0) {
+				infoMessage = `Importação concluída: ${batchSucceeded} URL(s) com sucesso e ${batchDocumentsImported} definição(ões) importada(s).`;
+			}
+
+			if (batchErrors.length > 0 && batchSucceeded === 0) {
+				errorMessage = 'Não foi possível importar as URLs do arquivo. Verifique os erros abaixo.';
+			}
+		} catch (error) {
+			errorMessage =
+				error instanceof Error ? error.message : 'Erro inesperado ao ler o arquivo de URLs.';
+		} finally {
+			isBatchImporting = false;
+			if (input) {
+				input.value = '';
+			}
+		}
+	}
+
 	const filteredGroups = $derived.by(() => {
 		if (!activeDocument) {
 			return [] as ApiGroup[];
@@ -279,36 +471,18 @@
 		infoMessage = '';
 
 		try {
-			const response = await fetch('/api/swagger', {
-				method: 'POST',
-				headers: {
-					'content-type': 'application/json'
-				},
-				body: JSON.stringify({ url: trimmed })
-			});
-
-			const payload = (await response.json()) as ParseSwaggerApiResponse | { error?: string };
-
-			if (!response.ok || !('documents' in payload) || !Array.isArray(payload.documents)) {
-				const responseError =
-					typeof payload === 'object' && payload !== null && 'error' in payload
-						? payload.error
-						: undefined;
-
-				throw new Error(responseError ?? 'Falha ao processar a URL informada.');
+			const result = await importUrlAndStore(trimmed);
+			if (!result.success) {
+				throw new Error(result.error ?? 'Falha ao processar a URL informada.');
 			}
 
-			for (const document of payload.documents) {
-				swaggerSession.upsert(document.sourceUrl, document);
+			if (result.sourceType === 'swagger-ui') {
+				infoMessage = `Swagger UI importada: ${result.documentsImported} definição(ões) válida(s) encontrada(s).`;
 			}
 
-			if (payload.sourceType === 'swagger-ui') {
-				infoMessage = `Swagger UI importada: ${payload.documents.length} definição(ões) válida(s) encontrada(s).`;
-			}
-
-			if (payload.warnings && payload.warnings.length > 0) {
+			if (result.warnings && result.warnings.length > 0) {
 				infoMessage =
-					`${infoMessage} ${payload.warnings.length} definição(ões) não puderam ser carregadas.`.trim();
+					`${infoMessage} ${result.warnings.length} definição(ões) não puderam ser carregadas.`.trim();
 			}
 
 			swaggerUrl = '';
@@ -330,6 +504,103 @@
 
 	function clearSession(): void {
 		swaggerSession.clear();
+	}
+
+	function setDocumentRefreshing(docId: string, value: boolean): void {
+		refreshingById = {
+			...refreshingById,
+			[docId]: value
+		};
+	}
+
+	function isDocumentRefreshing(docId: string): boolean {
+		return Boolean(refreshingById[docId]);
+	}
+
+	async function refreshSingleDocument(docId: string): Promise<void> {
+		const targetDoc = sessionState.current.documents.find((doc) => doc.id === docId);
+		if (!targetDoc || isRefreshingAll || isDocumentRefreshing(docId)) {
+			return;
+		}
+
+		const previousActiveId = sessionState.current.activeId;
+		errorMessage = '';
+		infoMessage = '';
+		setDocumentRefreshing(docId, true);
+
+		try {
+			const result = await importUrlAndStore(targetDoc.url);
+			if (!result.success) {
+				throw new Error(result.error ?? 'Falha ao atualizar documento.');
+			}
+
+			const title = getDocumentDisplayName(docId, targetDoc.result.title);
+			infoMessage = `Atualização concluída para ${title}: ${result.documentsImported} definição(ões) importada(s).`;
+			if (result.warnings && result.warnings.length > 0) {
+				infoMessage = `${infoMessage} ${result.warnings.length} definição(ões) não puderam ser carregadas.`;
+			}
+		} catch (error) {
+			const title = getDocumentDisplayName(docId, targetDoc.result.title);
+			errorMessage =
+				error instanceof Error
+					? `Falha ao atualizar ${title}: ${error.message}`
+					: `Falha ao atualizar ${title}.`;
+		} finally {
+			setDocumentRefreshing(docId, false);
+			if (previousActiveId) {
+				swaggerSession.setActive(previousActiveId);
+			}
+		}
+	}
+
+	async function refreshAllDocuments(): Promise<void> {
+		if (isRefreshingAll || sessionState.current.documents.length === 0) {
+			return;
+		}
+
+		const docs = [...sessionState.current.documents];
+		const previousActiveId = sessionState.current.activeId;
+		errorMessage = '';
+		infoMessage = '';
+		isRefreshingAll = true;
+
+		for (const doc of docs) {
+			setDocumentRefreshing(doc.id, true);
+		}
+
+		let successCount = 0;
+		let failCount = 0;
+		let definitionsImported = 0;
+		let warningCount = 0;
+
+		for (const doc of docs) {
+			const result = await importUrlAndStore(doc.url);
+			if (result.success) {
+				successCount += 1;
+				definitionsImported += result.documentsImported;
+				warningCount += result.warnings?.length ?? 0;
+			} else {
+				failCount += 1;
+			}
+
+			setDocumentRefreshing(doc.id, false);
+		}
+
+		isRefreshingAll = false;
+		if (previousActiveId) {
+			swaggerSession.setActive(previousActiveId);
+		}
+
+		if (successCount > 0) {
+			infoMessage = `Atualização em lote finalizada: ${successCount} API(s) atualizada(s) e ${definitionsImported} definição(ões) importada(s).`;
+			if (warningCount > 0) {
+				infoMessage = `${infoMessage} ${warningCount} aviso(s) durante a atualização.`;
+			}
+		}
+
+		if (failCount > 0) {
+			errorMessage = `${failCount} API(s) não puderam ser atualizadas nesta tentativa.`;
+		}
 	}
 
 	function formatMethod(method: HttpMethod): string {
@@ -388,6 +659,74 @@
 			/>
 			<button type="submit" disabled={isLoading}>{isLoading ? 'Lendo...' : 'Adicionar URL'}</button>
 		</form>
+
+		<div class="upload-card">
+			<div class="upload-header">
+				<strong>Importação em lote por arquivo</strong>
+				<small>Uma URL por linha</small>
+			</div>
+
+			<input
+				class="upload-native-input"
+				id="urls-file-input"
+				type="file"
+				accept=".txt,.list,.csv"
+				onchange={handleUrlsFileImport}
+				disabled={isBatchImporting}
+			/>
+
+			<label
+				class="upload-trigger"
+				class:is-importing={isBatchImporting}
+				for="urls-file-input"
+				aria-disabled={isBatchImporting}
+			>
+				<span class="upload-trigger-title"
+					>{isBatchImporting ? 'Importando arquivo...' : 'Selecionar arquivo de URLs'}</span
+				>
+				<span class="upload-trigger-subtitle">
+					{#if isBatchImporting}
+						{batchFileName || 'Aguarde...'}
+					{:else}
+						Formatos aceitos: .txt, .list, .csv
+					{/if}
+				</span>
+			</label>
+
+			<input
+				class="upload-ghost-input"
+				type="text"
+				readonly
+				value="Colete URLs em um arquivo e importe todas de forma assíncrona"
+			/>
+
+			{#if isBatchImporting || batchTotal > 0}
+				<div class="batch-progress">
+					<div class="batch-progress-track">
+						<div class="batch-progress-fill" style={`width: ${batchProgressPercent}%`}></div>
+					</div>
+					<p class="result-count">
+						{isBatchImporting
+							? `Importando ${batchFileName || 'arquivo'} • ${batchProgressLabel}`
+							: `Última importação (${batchFileName || 'arquivo'}) • ${batchProgressLabel}`}
+					</p>
+				</div>
+			{/if}
+
+			{#if batchErrors.length > 0}
+				<div class="batch-errors">
+					<strong>Falhas de importação</strong>
+					<ul>
+						{#each batchErrors as item, index (`${item.url}-${index}`)}
+							<li>
+								<span>{item.url}</span>
+								<small>{item.message}</small>
+							</li>
+						{/each}
+					</ul>
+				</div>
+			{/if}
+		</div>
 
 		{#if errorMessage}
 			<p class="error">{errorMessage}</p>
@@ -469,9 +808,24 @@
 		<aside class="sources">
 			<div class="aside-header">
 				<h2>Swaggers na sessão</h2>
-				{#if sessionState.current.documents.length > 0}
-					<button type="button" class="clear-btn" onclick={clearSession}>Limpar</button>
-				{/if}
+				<div class="aside-actions">
+					<button
+						type="button"
+						class="icon-btn"
+						title="Atualizar todas as APIs"
+						onclick={refreshAllDocuments}
+						disabled={isRefreshingAll || sessionState.current.documents.length === 0}
+					>
+						<svg viewBox="0 -960 960 960" aria-hidden="true">
+							<path
+								d="M480-160q-134 0-227-93t-93-227h80q0 100 70 170t170 70q100 0 170-70t70-170q0-100-70-170t-170-70h-7l64 64-57 56-160-160 160-160 57 56-64 64h7q134 0 227 93t93 227q0 134-93 227t-227 93Z"
+							></path>
+						</svg>
+					</button>
+					{#if sessionState.current.documents.length > 0}
+						<button type="button" class="clear-btn" onclick={clearSession}>Limpar</button>
+					{/if}
+				</div>
 			</div>
 
 			{#if sessionState.current.documents.length === 0}
@@ -486,9 +840,24 @@
 								<span>{doc.result.totalEndpoints} endpoint(s)</span>
 								<small>{doc.url}</small>
 							</button>
-							<button type="button" class="remove-btn" onclick={() => removeDocument(doc.id)}>
-								Remover
-							</button>
+							<div class="doc-actions">
+								<button
+									type="button"
+									class="icon-btn"
+									title="Atualizar esta API"
+									onclick={() => refreshSingleDocument(doc.id)}
+									disabled={isRefreshingAll || isDocumentRefreshing(doc.id)}
+								>
+									<svg viewBox="0 -960 960 960" aria-hidden="true">
+										<path
+											d="M480-160q-134 0-227-93t-93-227h80q0 100 70 170t170 70q100 0 170-70t70-170q0-100-70-170t-170-70h-7l64 64-57 56-160-160 160-160 57 56-64 64h7q134 0 227 93t93 227q0 134-93 227t-227 93Z"
+										></path>
+									</svg>
+								</button>
+								<button type="button" class="remove-btn" onclick={() => removeDocument(doc.id)}>
+									Remover
+								</button>
+							</div>
 						</li>
 					{/each}
 				</ul>
@@ -678,6 +1047,180 @@
 		margin-top: 0.8rem;
 	}
 
+	.upload-card {
+		margin-top: 0.9rem;
+		padding: 1rem;
+		border: 1px solid rgb(255 255 255 / 14%);
+		border-radius: 0.8rem;
+		background:
+			linear-gradient(135deg, rgb(21 37 64 / 84%), rgb(12 24 43 / 88%)),
+			radial-gradient(circle at top right, rgb(255 214 107 / 20%), transparent 40%);
+		box-shadow: inset 0 0 0 1px rgb(255 255 255 / 5%);
+	}
+
+	.upload-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		gap: 0.8rem;
+	}
+
+	.upload-header strong {
+		font-size: 0.96rem;
+		color: #f4f8ff;
+	}
+
+	.upload-header small {
+		color: #adc2da;
+		font-size: 0.8rem;
+	}
+
+	.upload-native-input {
+		display: none;
+	}
+
+	.upload-trigger {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.6rem;
+		margin-top: 0.75rem;
+		padding: 0.56rem 0.72rem;
+		border-radius: 0.58rem;
+		border: 1px solid rgb(255 255 255 / 22%);
+		background: linear-gradient(135deg, rgb(255 214 107 / 95%), rgb(255 146 107 / 95%));
+		color: #1d2430;
+		cursor: pointer;
+		width: 100%;
+		box-sizing: border-box;
+		transition:
+			transform 140ms ease,
+			box-shadow 140ms ease,
+			filter 140ms ease;
+	}
+
+	.upload-trigger.is-importing {
+		flex-direction: column;
+		align-items: flex-start;
+		justify-content: flex-start;
+	}
+
+	.upload-trigger:hover {
+		transform: translateY(-1px);
+		box-shadow: 0 8px 18px rgb(255 146 107 / 25%);
+		filter: brightness(1.03);
+	}
+
+	.upload-trigger[aria-disabled='true'] {
+		cursor: wait;
+		opacity: 0.75;
+		transform: none;
+		box-shadow: none;
+	}
+
+	.upload-trigger-title,
+	.upload-trigger-subtitle {
+		display: inline;
+	}
+
+	.upload-trigger-title {
+		font-size: 0.84rem;
+		font-weight: 700;
+	}
+
+	.upload-trigger-subtitle {
+		margin-top: 0.12rem;
+		font-size: 0.7rem;
+		opacity: 0.9;
+		white-space: nowrap;
+		text-align: right;
+	}
+
+	.upload-trigger.is-importing .upload-trigger-subtitle {
+		margin-top: 0;
+		white-space: normal;
+		text-align: left;
+	}
+
+	.upload-ghost-input {
+		display: block;
+		box-sizing: border-box;
+		max-width: 100%;
+		margin-top: 0.55rem;
+		width: 100%;
+		background: rgb(7 14 26 / 62%);
+		border: 1px dashed rgb(255 255 255 / 18%);
+		border-radius: 0.6rem;
+		padding: 0.58rem 0.7rem;
+		color: #9fb4cc;
+		font-size: 0.82rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.batch-progress {
+		margin-top: 0.7rem;
+	}
+
+	.batch-progress-track {
+		height: 8px;
+		border-radius: 999px;
+		background: rgb(255 255 255 / 10%);
+		overflow: hidden;
+	}
+
+	.batch-progress-fill {
+		height: 100%;
+		border-radius: inherit;
+		background: linear-gradient(90deg, #58d7ff, #ffd66b);
+		transition: width 180ms ease;
+	}
+
+	.batch-errors {
+		margin-top: 0.7rem;
+		padding: 0.75rem;
+		border: 1px solid rgb(255 120 120 / 35%);
+		border-radius: 0.65rem;
+		background: rgb(255 120 120 / 8%);
+	}
+
+	.batch-errors strong {
+		display: block;
+		margin-bottom: 0.45rem;
+		color: #ffd3d3;
+	}
+
+	.batch-errors ul {
+		margin: 0;
+		padding: 0;
+		list-style: none;
+		display: grid;
+		gap: 0.45rem;
+	}
+
+	.batch-errors li {
+		display: block;
+		padding: 0.45rem;
+		border-radius: 0.45rem;
+		background: rgb(255 255 255 / 5%);
+	}
+
+	.batch-errors li span,
+	.batch-errors li small {
+		display: block;
+		word-break: break-word;
+	}
+
+	.batch-errors li span {
+		color: #ffd0d0;
+		font-size: 0.84rem;
+	}
+
+	.batch-errors li small {
+		margin-top: 0.2rem;
+		color: #f3c2c2;
+	}
+
 	.global-results {
 		margin-top: 1rem;
 		background: rgb(7 14 26 / 82%);
@@ -688,8 +1231,12 @@
 
 	.source-link {
 		font-size: 1rem;
-		font-weight: 700;
-		text-decoration: underline;
+		display: inline-flex;
+		flex-direction: column;
+		align-items: flex-start;
+		padding: 0.56rem 0.72rem;
+		border-radius: 0.58rem;
+		max-width: 100%;
 		text-decoration-color: rgb(255 214 107 / 60%);
 	}
 
@@ -723,16 +1270,41 @@
 		gap: 0.8rem;
 	}
 
+	.aside-actions {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+	}
+
 	.aside-header h2,
 	.catalog-header h2 {
 		margin: 0;
-		font-size: 1.1rem;
+		font-size: 0.84rem;
+		font-weight: 700;
 	}
 
 	.clear-btn,
 	.remove-btn {
 		padding: 0.4rem 0.6rem;
-		font-size: 0.8rem;
+		font-size: 0.7rem;
+	}
+
+	.icon-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 30px;
+		height: 30px;
+		padding: 0;
+		border-radius: 0.5rem;
+		background: linear-gradient(135deg, #79ddff, #58b8ff);
+		color: #122033;
+	}
+
+	.icon-btn svg {
+		width: 16px;
+		height: 16px;
+		fill: currentColor;
 	}
 
 	.source-list {
@@ -761,6 +1333,13 @@
 		padding: 0;
 		background: transparent;
 		color: inherit;
+	}
+
+	.doc-actions {
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 0.35rem;
 	}
 
 	.source-item span,
