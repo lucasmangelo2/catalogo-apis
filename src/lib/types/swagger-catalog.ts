@@ -26,6 +26,7 @@ export interface ParsedSwaggerResult {
 	sourceUrl: string;
 	documentVersion: string;
 	title: string;
+	apiVersion?: string;
 	totalEndpoints: number;
 	apiGroups: ApiGroup[];
 	fetchedAt: string;

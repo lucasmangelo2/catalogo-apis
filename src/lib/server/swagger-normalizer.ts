@@ -22,6 +22,7 @@ interface GenericDocument {
 	swagger?: string;
 	info?: {
 		title?: string;
+		version?: string;
 	};
 	paths?: Record<string, Record<string, Record<string, unknown>>>;
 }
@@ -156,11 +157,13 @@ export function normalizeSwaggerDocument(
 		.sort((a, b) => a.name.localeCompare(b.name));
 
 	const title = doc.info?.title?.trim() || 'Documento sem titulo';
+	const apiVersion = doc.info?.version?.trim() || undefined;
 
 	return {
 		sourceUrl,
 		documentVersion: guessVersion(doc),
 		title,
+		apiVersion,
 		totalEndpoints,
 		apiGroups,
 		fetchedAt: fetchedAtIso

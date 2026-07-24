@@ -16,6 +16,20 @@
 		warnings?: string[];
 	}
 
+	interface GlobalEndpointMatch {
+		apiName: string;
+		controllerName: string;
+		endpoint: EndpointItem;
+	}
+
+	interface GlobalSearchResult {
+		documentId: string;
+		documentName: string;
+		sourceUrl: string;
+		matchCount: number;
+		matches: GlobalEndpointMatch[];
+	}
+
 	const sessionState = fromStore(swaggerSession);
 	const methods: Array<'all' | HttpMethod> = [
 		'all',
@@ -31,10 +45,62 @@
 
 	let swaggerUrl = $state('');
 	let searchText = $state('');
+	let globalSearchText = $state('');
+	let globalMethodFilter = $state<'all' | HttpMethod>('all');
 	let methodFilter = $state<'all' | HttpMethod>('all');
 	let isLoading = $state(false);
 	let errorMessage = $state('');
 	let infoMessage = $state('');
+
+	function normalizeSearchText(value: string): string {
+		return value.trim().toLowerCase();
+	}
+
+	function endpointSearchBlob(
+		endpoint: EndpointItem,
+		apiName: string,
+		controllerName: string
+	): string {
+		return [
+			apiName,
+			controllerName,
+			endpoint.path,
+			endpoint.summary,
+			endpoint.description,
+			endpoint.operationId,
+			endpoint.tags.join(' ')
+		]
+			.filter(Boolean)
+			.join(' ')
+			.toLowerCase();
+	}
+
+	function extractVersionFromUrl(url: string): string | null {
+		const match = url.match(/(?:^|[\\/._-])(v\d+(?:[._-]?\d+)?)(?:$|[\\/._-])/i);
+		if (!match?.[1]) {
+			return null;
+		}
+
+		return match[1].toLowerCase();
+	}
+
+	function resolveDocumentIdentifier(result: ParsedSwaggerResult): string | null {
+		const fromInfo = result.apiVersion?.trim();
+		if (fromInfo) {
+			return fromInfo;
+		}
+
+		const fromUrl = extractVersionFromUrl(result.sourceUrl);
+		if (fromUrl) {
+			return fromUrl;
+		}
+
+		return null;
+	}
+
+	function sanitizeIdentifier(value: string): string {
+		return value.replace(/[()]/g, '').trim() || 'def';
+	}
 
 	const activeDocument = $derived.by(() => {
 		const state = sessionState.current;
@@ -44,6 +110,99 @@
 
 		return state.documents.find((doc) => doc.id === state.activeId) ?? null;
 	});
+
+	const documentNameById = $derived.by(() => {
+		const docs = sessionState.current.documents;
+		const byTitle: Record<string, typeof docs> = {};
+
+		for (const doc of docs) {
+			const key = doc.result.title.trim().toLowerCase() || '(sem-titulo)';
+			const list = byTitle[key] ?? [];
+			list.push(doc);
+			byTitle[key] = list;
+		}
+
+		const result: Record<string, string> = {};
+
+		for (const list of Object.values(byTitle)) {
+			if (list.length === 1) {
+				result[list[0].id] = list[0].result.title;
+				continue;
+			}
+
+			const usage: Record<string, number> = {};
+			for (let index = 0; index < list.length; index += 1) {
+				const doc = list[index];
+				const baseIdentifier = resolveDocumentIdentifier(doc.result) ?? `def-${index + 1}`;
+				const cleanIdentifier = sanitizeIdentifier(baseIdentifier);
+				const count = (usage[cleanIdentifier] ?? 0) + 1;
+				usage[cleanIdentifier] = count;
+
+				const uniqueIdentifier = count === 1 ? cleanIdentifier : `${cleanIdentifier}-${count}`;
+				result[doc.id] = `${doc.result.title} (${uniqueIdentifier})`;
+			}
+		}
+
+		return result;
+	});
+
+	const globalSearchResults = $derived.by(() => {
+		const query = normalizeSearchText(globalSearchText);
+		const hasCriteria = query.length > 0 || globalMethodFilter !== 'all';
+		if (!hasCriteria) {
+			return [] as GlobalSearchResult[];
+		}
+
+		const results: GlobalSearchResult[] = [];
+
+		for (const doc of sessionState.current.documents) {
+			const matches: GlobalEndpointMatch[] = [];
+
+			for (const apiGroup of doc.result.apiGroups) {
+				for (const controller of apiGroup.controllers) {
+					for (const endpoint of controller.endpoints) {
+						const matchesMethod =
+							globalMethodFilter === 'all' || endpoint.method === globalMethodFilter;
+						if (!matchesMethod) {
+							continue;
+						}
+
+						const matchesText =
+							query.length === 0 ||
+							endpointSearchBlob(endpoint, apiGroup.name, controller.name).includes(query);
+
+						if (matchesText) {
+							matches.push({
+								apiName: apiGroup.name,
+								controllerName: controller.name,
+								endpoint
+							});
+						}
+					}
+				}
+			}
+
+			if (matches.length > 0) {
+				results.push({
+					documentId: doc.id,
+					documentName: documentNameById[doc.id] ?? doc.result.title,
+					sourceUrl: doc.url,
+					matchCount: matches.length,
+					matches: matches.slice(0, 30)
+				});
+			}
+		}
+
+		return results.sort((a, b) => b.matchCount - a.matchCount);
+	});
+
+	const globalMatchCount = $derived.by(() =>
+		globalSearchResults.reduce((acc, result) => acc + result.matchCount, 0)
+	);
+
+	const hasGlobalSearchCriteria = $derived.by(
+		() => normalizeSearchText(globalSearchText).length > 0 || globalMethodFilter !== 'all'
+	);
 
 	const filteredGroups = $derived.by(() => {
 		if (!activeDocument) {
@@ -65,16 +224,7 @@
 								return true;
 							}
 
-							const text = [
-								endpoint.path,
-								endpoint.summary,
-								endpoint.description,
-								endpoint.operationId,
-								endpoint.tags.join(' ')
-							]
-								.filter(Boolean)
-								.join(' ')
-								.toLowerCase();
+							const text = endpointSearchBlob(endpoint, group.name, controller.name);
 
 							return text.includes(query);
 						});
@@ -153,12 +303,12 @@
 			}
 
 			if (payload.sourceType === 'swagger-ui') {
-				infoMessage = `Swagger UI importada: ${payload.documents.length} definicao(oes) valida(s) encontrada(s).`;
+				infoMessage = `Swagger UI importada: ${payload.documents.length} definição(ões) válida(s) encontrada(s).`;
 			}
 
 			if (payload.warnings && payload.warnings.length > 0) {
 				infoMessage =
-					`${infoMessage} ${payload.warnings.length} definicao(oes) nao puderam ser carregadas.`.trim();
+					`${infoMessage} ${payload.warnings.length} definição(ões) não puderam ser carregadas.`.trim();
 			}
 
 			swaggerUrl = '';
@@ -206,22 +356,26 @@
 	function endpointKey(endpoint: EndpointItem): string {
 		return `${endpoint.method}:${endpoint.path}:${endpoint.operationId}`;
 	}
+
+	function globalEndpointKey(match: GlobalEndpointMatch): string {
+		return `${match.apiName}:${match.controllerName}:${endpointKey(match.endpoint)}`;
+	}
 </script>
 
 <svelte:head>
-	<title>Catalogo de APIs Swagger</title>
+	<title>Catálogo de APIs Swagger</title>
 	<meta
 		name="description"
-		content="Importe URLs Swagger/OpenAPI, organize endpoints por API, controller e endpoint, e mantenha a navegacao em memoria de sessao."
+		content="Importe URLs Swagger/OpenAPI, organize endpoints por API, controller e endpoint, e mantenha a navegação em memória de sessão."
 	/>
 </svelte:head>
 
 <main class="page">
 	<section class="hero">
-		<h1>Catalogo Dinamico de APIs</h1>
+		<h1>Catálogo Dinâmico de APIs</h1>
 		<p>
-			Importe uma ou varias URLs Swagger/OpenAPI. O sistema interpreta versoes Swagger 2.0 e OpenAPI
-			3.x automaticamente, sem configuracao manual.
+			Importe uma ou várias URLs Swagger/OpenAPI. O sistema interpreta versões Swagger 2.0 e OpenAPI
+			3.x automaticamente, sem configuração manual.
 		</p>
 
 		<form class="import-form" onsubmit={addSwaggerUrl}>
@@ -244,23 +398,90 @@
 		{/if}
 	</section>
 
+	<section class="search-card">
+		<h2>Filtro global de endpoints</h2>
+		<div class="search-grid">
+			<select bind:value={globalMethodFilter} aria-label="Filtrar método global">
+				{#each methods as method (method)}
+					<option value={method}
+						>{method === 'all' ? 'Todos os métodos' : method.toUpperCase()}</option
+					>
+				{/each}
+			</select>
+
+			<input
+				type="search"
+				bind:value={globalSearchText}
+				placeholder="Buscar por endpoint, controller, API, tag ou operationId"
+			/>
+		</div>
+
+		{#if hasGlobalSearchCriteria}
+			<p class="result-count">
+				{globalMatchCount} endpoint(s) encontrado(s) em {globalSearchResults.length} swagger(s)
+			</p>
+		{/if}
+	</section>
+
+	{#if hasGlobalSearchCriteria}
+		<section class="global-results">
+			{#if globalSearchResults.length === 0}
+				<p class="empty">Nenhum endpoint encontrado com os filtros selecionados.</p>
+			{:else}
+				<div class="groups">
+					{#each globalSearchResults as result (result.documentId)}
+						<article class="api-group">
+							<h3>
+								<button
+									type="button"
+									class="source-item source-link"
+									onclick={() => activateDocument(result.documentId)}
+								>
+									{result.documentName}
+								</button>
+								<span>{result.matchCount} match(es)</span>
+							</h3>
+							<small class="source-url">{result.sourceUrl}</small>
+
+							<ul>
+								{#each result.matches as match (globalEndpointKey(match))}
+									<li>
+										<span class={methodClass(match.endpoint.method)}
+											>{formatMethod(match.endpoint.method)}</span
+										>
+										<div>
+											<p class="path">{match.endpoint.path}</p>
+											<small>
+												/{match.apiName} • {match.controllerName}
+											</small>
+										</div>
+									</li>
+								{/each}
+							</ul>
+						</article>
+					{/each}
+				</div>
+			{/if}
+		</section>
+	{/if}
+
 	<section class="content">
 		<aside class="sources">
 			<div class="aside-header">
-				<h2>Swaggers na sessao</h2>
+				<h2>Swaggers na sessão</h2>
 				{#if sessionState.current.documents.length > 0}
 					<button type="button" class="clear-btn" onclick={clearSession}>Limpar</button>
 				{/if}
 			</div>
 
 			{#if sessionState.current.documents.length === 0}
-				<p class="empty">Nenhuma URL adicionada nesta sessao.</p>
+				<p class="empty">Nenhuma URL adicionada nesta sessão.</p>
 			{:else}
 				<ul class="source-list">
 					{#each sessionState.current.documents as doc (doc.id)}
 						<li class:active={sessionState.current.activeId === doc.id}>
 							<button type="button" class="source-item" onclick={() => activateDocument(doc.id)}>
-								<strong>{doc.result.title}</strong>
+								<strong>{documentNameById[doc.id] ?? doc.result.title}</strong>
 								<span>{doc.result.documentVersion}</span>
 								<span>{doc.result.totalEndpoints} endpoint(s)</span>
 								<small>{doc.url}</small>
@@ -286,7 +507,7 @@
 			{:else}
 				<header class="catalog-header">
 					<div>
-						<h2>{activeDocument.result.title}</h2>
+						<h2>{documentNameById[activeDocument.id] ?? activeDocument.result.title}</h2>
 						<p>
 							{activeDocument.result.documentVersion} • {activeDocument.result.totalEndpoints}
 							endpoint(s)
@@ -302,7 +523,7 @@
 						<select bind:value={methodFilter}>
 							{#each methods as method (method)}
 								<option value={method}
-									>{method === 'all' ? 'Todos os metodos' : method.toUpperCase()}</option
+									>{method === 'all' ? 'Todos os métodos' : method.toUpperCase()}</option
 								>
 							{/each}
 						</select>
@@ -398,6 +619,8 @@
 	}
 
 	.import-form input,
+	.search-card input,
+	.search-card select,
 	.filters input,
 	.filters select {
 		background: rgb(11 20 35 / 78%);
@@ -425,6 +648,56 @@
 	.error {
 		margin-top: 0.8rem;
 		color: #ffad9e;
+	}
+
+	.search-card {
+		margin-top: 1rem;
+		background: rgb(7 14 26 / 82%);
+		border: 1px solid rgb(255 255 255 / 10%);
+		border-radius: 1rem;
+		padding: 1rem;
+	}
+
+	.search-card h2 {
+		margin: 0;
+		font-size: 1.1rem;
+	}
+
+	.search-grid {
+		display: grid;
+		grid-template-columns: 220px minmax(0, 1fr);
+		gap: 0.8rem;
+		margin-top: 0.8rem;
+	}
+
+	.search-card input {
+		margin-top: 0;
+	}
+
+	.search-card p {
+		margin-top: 0.8rem;
+	}
+
+	.global-results {
+		margin-top: 1rem;
+		background: rgb(7 14 26 / 82%);
+		border: 1px solid rgb(255 255 255 / 10%);
+		border-radius: 1rem;
+		padding: 1rem;
+	}
+
+	.source-link {
+		font-size: 1rem;
+		font-weight: 700;
+		text-decoration: underline;
+		text-decoration-color: rgb(255 214 107 / 60%);
+	}
+
+	.source-url {
+		display: block;
+		margin-top: 0.35rem;
+		color: #b8c9dd;
+		word-break: break-word;
 	}
 
 	.content {
@@ -632,6 +905,7 @@
 		}
 
 		.import-form,
+		.search-grid,
 		.filters {
 			grid-template-columns: 1fr;
 		}
