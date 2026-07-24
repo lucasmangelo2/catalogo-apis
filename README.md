@@ -3,7 +3,9 @@
 Aplicacao frontend em SvelteKit para:
 
 - Capturar URLs de documentos Swagger/OpenAPI
+- Capturar tambem URLs de Swagger UI (index.html)
 - Interpretar automaticamente Swagger 2.0 e OpenAPI 3.x (JSON ou YAML)
+- Descobrir automaticamente multiplas definicoes/versionamentos expostos pelo Swagger UI
 - Listar e agrupar endpoints por API principal, controller e endpoint
 - Manter URLs e resultados em memoria de sessao do navegador para navegacao rapida
 
@@ -25,13 +27,16 @@ Abra a URL exibida no terminal (normalmente http://localhost:5173).
 
 ## Como usar
 
-1. Cole uma URL Swagger/OpenAPI no campo principal (ex.: swagger.json ou openapi.yaml).
+1. Cole uma URL no campo principal. Exemplos validos:
+   - URL direta da especificacao (swagger.json, openapi.json, openapi.yaml)
+   - URL do Swagger UI (index.html ou rota equivalente)
 2. Clique em Adicionar URL.
-3. Navegue pelos grupos:
+3. Se a URL for de Swagger UI, o sistema tenta descobrir e importar todas as definicoes/versionamentos expostos no initializer.
+4. Navegue pelos grupos:
    - API principal (primeiro segmento da rota)
    - Controller (tag do endpoint ou segmento de rota)
    - Endpoint (metodo + path)
-4. Use busca textual e filtro por metodo para localizar endpoints rapidamente.
+5. Use busca textual e filtro por metodo para localizar endpoints rapidamente.
 
 ## Comportamento de sessao
 
@@ -53,4 +58,5 @@ npm run test     # testes (vitest)
 
 - O parsing ocorre no endpoint interno /api/swagger para evitar problemas de CORS no browser.
 - A API tenta parsear como JSON e, em caso de falha, faz fallback para YAML.
+- Se o conteudo for HTML de Swagger UI, a API extrai as URLs de definicao e consulta cada uma automaticamente.
 - Caso o documento remoto nao tenha paths, a API retorna erro orientando ajuste da URL.

@@ -9,6 +9,13 @@
 		ParsedSwaggerResult
 	} from '$lib/types/swagger-catalog';
 
+	interface ParseSwaggerApiResponse {
+		documents: ParsedSwaggerResult[];
+		sourceType: 'spec' | 'swagger-ui';
+		discoveredUrls: number;
+		warnings?: string[];
+	}
+
 	const sessionState = fromStore(swaggerSession);
 	const methods: Array<'all' | HttpMethod> = [
 		'all',
@@ -27,6 +34,7 @@
 	let methodFilter = $state<'all' | HttpMethod>('all');
 	let isLoading = $state(false);
 	let errorMessage = $state('');
+	let infoMessage = $state('');
 
 	const activeDocument = $derived.by(() => {
 		const state = sessionState.current;
@@ -118,6 +126,7 @@
 
 		isLoading = true;
 		errorMessage = '';
+		infoMessage = '';
 
 		try {
 			const response = await fetch('/api/swagger', {
@@ -128,9 +137,9 @@
 				body: JSON.stringify({ url: trimmed })
 			});
 
-			const payload = (await response.json()) as ParsedSwaggerResult | { error?: string };
+			const payload = (await response.json()) as ParseSwaggerApiResponse | { error?: string };
 
-			if (!response.ok || !('apiGroups' in payload)) {
+			if (!response.ok || !('documents' in payload) || !Array.isArray(payload.documents)) {
 				const responseError =
 					typeof payload === 'object' && payload !== null && 'error' in payload
 						? payload.error
@@ -139,7 +148,19 @@
 				throw new Error(responseError ?? 'Falha ao processar a URL informada.');
 			}
 
-			swaggerSession.upsert(trimmed, payload);
+			for (const document of payload.documents) {
+				swaggerSession.upsert(document.sourceUrl, document);
+			}
+
+			if (payload.sourceType === 'swagger-ui') {
+				infoMessage = `Swagger UI importada: ${payload.documents.length} definicao(oes) valida(s) encontrada(s).`;
+			}
+
+			if (payload.warnings && payload.warnings.length > 0) {
+				infoMessage =
+					`${infoMessage} ${payload.warnings.length} definicao(oes) nao puderam ser carregadas.`.trim();
+			}
+
 			swaggerUrl = '';
 		} catch (error) {
 			errorMessage =
@@ -216,6 +237,10 @@
 
 		{#if errorMessage}
 			<p class="error">{errorMessage}</p>
+		{/if}
+
+		{#if infoMessage}
+			<p class="result-count">{infoMessage}</p>
 		{/if}
 	</section>
 
