@@ -956,7 +956,7 @@
 	}
 
 	.page {
-		max-width: 1200px;
+		max-width: 80%;
 		margin: 0 auto;
 		padding: 2rem 1rem 3rem;
 	}
@@ -1333,6 +1333,7 @@
 		padding: 0;
 		background: transparent;
 		color: inherit;
+    	max-width: 165px;
 	}
 
 	.doc-actions {
@@ -1352,6 +1353,10 @@
 		margin-top: 0.25rem;
 		font-size: 0.72rem;
 		word-break: break-word;
+	}
+
+	.source-item strong {
+    	word-break: break-word;
 	}
 
 	.empty-catalog {
